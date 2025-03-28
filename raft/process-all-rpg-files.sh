@@ -21,6 +21,15 @@ QG_MODEL="google/flan-t5-large"
 COT_MODEL="google/flan-t5-xl"
 QA_MODEL="deepset/deberta-v3-large-squad2"
 
+# Create output directory if it doesn't exist
+mkdir -p "$OUTPUT_DIR"
+
+# Function to get file extension
+get_extension() {
+    filename=$(basename -- "$1")
+    echo "${filename##*.}"
+}
+
 # Process command line arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
