@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import logging
 import os
@@ -6,35 +7,19 @@ import random
 import re
 import shutil
 from math import ceil
-from pathlib import Path
 from typing import Literal
 
-import onnxruntime as ort
 import PyPDF2
+import torch
 from datasets import Dataset, concatenate_datasets
-
-# Add optimum imports
-from optimum.onnxruntime import ORTModelForSeq2SeqLM
-from optimum.pipelines import pipeline
-from transformers import AutoTokenizer
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("raft_script")
 
-# Preload necessary DLLs
-ort.preload_dlls()
-
-# Configure ONNX Runtime to use GPU if available
-available_providers = ort.get_available_providers()
-if "CUDAExecutionProvider" in available_providers:
-    sess_options = ort.SessionOptions()
-    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-    logger.info("Using CUDA GPU with ONNX Runtime")
-else:
-    sess_options = ort.SessionOptions()
-    providers = ["CPUExecutionProvider"]
-    logger.info("No GPU found for ONNX Runtime. Using CPU.")
+# Global flag to force CPU-only mode
+FORCE_CPU_ONLY = False
 
 # Document type literals
 DocType = Literal["api", "pdf", "json", "txt", "md"]
@@ -42,83 +27,43 @@ DocType = Literal["api", "pdf", "json", "txt", "md"]
 # Every N chunks, save a checkpoint
 N = 15
 
-# ONNX model cache directory
-ONNX_MODEL_CACHE = Path("onnx_models")
-ONNX_MODEL_CACHE.mkdir(exist_ok=True)
 
-
-# Helper functions for ONNX model handling
-def get_onnx_model_path(model_name: str) -> str:
+def get_device():
     """
-    Returns the path for the ONNX version of a model, creating a sanitized filename.
-
-    Args:
-        model_name: The original Hugging Face model name
-
-    Returns:
-        The path to the ONNX model file
+    Determines the appropriate device (CUDA/CPU) to use based on availability and settings.
     """
-    # Sanitize model name for file path
-    safe_name = model_name.replace("/", "_")
-    return str(ONNX_MODEL_CACHE / safe_name)
+    if FORCE_CPU_ONLY or not torch.cuda.is_available():
+        logger.info("Using CPU for model inference")
+        return torch.device("cpu")
+    logger.info("Using CUDA for model inference")
+    return torch.device("cuda")
 
 
-def convert_model_to_onnx(model_name: str) -> str:
+def load_model(model_name: str):
     """
-    Converts a Hugging Face model to ONNX format if not already converted.
-
-    Args:
-        model_name: The Hugging Face model name to convert
-
-    Returns:
-        The path to the ONNX model directory
-    """
-    onnx_path = get_onnx_model_path(model_name)
-
-    if os.path.exists(onnx_path):
-        logger.info(f"Using existing ONNX model at {onnx_path}")
-        return onnx_path
-
-    logger.info(f"Converting {model_name} to ONNX format using optimum...")
-
-    # Use optimum to convert the model - much simpler than manual conversion
-    ort_model = ORTModelForSeq2SeqLM.from_pretrained(
-        model_name,
-        export=True,
-        provider="CPUExecutionProvider"
-        if "CUDAExecutionProvider" not in ort.get_available_providers()
-        else "CUDAExecutionProvider",
-    )
-
-    # Save the model to the cache directory
-    ort_model.save_pretrained(onnx_path)
-
-    logger.info(f"Model converted and saved to {onnx_path}")
-    return onnx_path
-
-
-def create_onnx_session(model_name: str) -> ORTModelForSeq2SeqLM:
-    """
-    Creates an optimum ORTModelForSeq2SeqLM for the given model.
+    Loads a model with caching for better memory management.
 
     Args:
         model_name: The Hugging Face model name
 
     Returns:
-        An ORTModelForSeq2SeqLM object
+        The loaded model and tokenizer
     """
-    onnx_path = convert_model_to_onnx(model_name)
-    provider = (
-        "CPUExecutionProvider"
-        if "CUDAExecutionProvider" not in ort.get_available_providers()
-        else "CUDAExecutionProvider"
-    )
-    print(f"Using provider {provider}")
-    return ORTModelForSeq2SeqLM.from_pretrained(onnx_path, provider=provider)
+    device = get_device()
+
+    # Get tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+    # Get model
+    logger.info(f"Loading model {model_name} to {device}")
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    model.to(device)
+
+    return model, tokenizer
 
 
-def generate_with_onnx(
-    model: ORTModelForSeq2SeqLM,
+def generate_text(
+    model,
     tokenizer,
     input_text: str,
     max_length: int = 512,
@@ -126,11 +71,11 @@ def generate_with_onnx(
     temperature: float = 0.7,
 ) -> list[str]:
     """
-    Generates text using an optimum ONNX model.
+    Generates text using a transformer model.
 
     Args:
-        model: The ORTModelForSeq2SeqLM instance
-        tokenizer: The Hugging Face tokenizer
+        model: The model
+        tokenizer: The tokenizer
         input_text: The input text prompt
         max_length: Maximum length of the generated text
         num_return_sequences: Number of sequences to generate
@@ -139,20 +84,32 @@ def generate_with_onnx(
     Returns:
         A list of generated text sequences
     """
-    # Create a pipeline for text generation
-    gen_pipeline = pipeline("text2text-generation", model=model, tokenizer=tokenizer)
+    try:
+        device = next(model.parameters()).device
 
-    # Generate text using the pipeline
-    outputs = gen_pipeline(
-        input_text,
-        max_length=max_length,
-        num_return_sequences=num_return_sequences,
-        temperature=temperature,
-        do_sample=(temperature > 0),
-    )
+        inputs = tokenizer(input_text, return_tensors="pt", truncation=True, padding="longest").to(device)
 
-    # Extract generated text from outputs
-    return [output["generated_text"] for output in outputs]
+        do_sample = temperature > 0
+
+        outputs = model.generate(
+            inputs.input_ids,
+            max_length=max_length,
+            num_return_sequences=num_return_sequences,
+            temperature=temperature if do_sample else None,
+            do_sample=do_sample,
+        )
+
+        result = [tokenizer.decode(output, skip_special_tokens=True) for output in outputs]
+
+        # Clean up to free memory
+        del inputs, outputs
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        return result
+    except Exception as e:
+        logger.error(f"Error generating text: {e}")
+        return ["Failed to generate text due to an error."] * num_return_sequences
 
 
 def get_args() -> argparse.Namespace:
@@ -196,8 +153,16 @@ def get_args() -> argparse.Namespace:
     parser.add_argument(
         "--cot-model", type=str, default="google/flan-t5-xl", help="Model to use for chain-of-thought reasoning"
     )
+    parser.add_argument("--cpu-only", action="store_true", help="Force CPU-only mode for model inference")
 
     args = parser.parse_args()
+
+    # Set global CPU-only flag
+    global FORCE_CPU_ONLY
+    FORCE_CPU_ONLY = args.cpu_only
+    if FORCE_CPU_ONLY:
+        logger.info("CPU-only mode enabled. Will not use GPU even if available.")
+
     return args
 
 
@@ -275,7 +240,7 @@ def clean_chunk(chunk: str) -> str:
 
 def generate_questions_hf(chunk: str, x: int = 5, model_name: str = "google/flan-t5-large") -> list[str]:
     """
-    Uses optimum ONNX model to generate `x` questions based on the given text chunk.
+    Uses PyTorch model to generate `x` questions based on the given text chunk.
 
     Args:
         chunk: The text chunk to generate questions from
@@ -285,15 +250,16 @@ def generate_questions_hf(chunk: str, x: int = 5, model_name: str = "google/flan
     Returns:
         A list of generated questions
     """
-    # Load the tokenizer and ONNX model for question generation
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = create_onnx_session(model_name)
+    try:
+        # Load model and tokenizer
+        model, tokenizer = load_model(model_name)
+        logger.info(f"Generating {x} questions with model {model_name}")
 
-    # Clean the chunk
-    clean_text = clean_chunk(chunk)
+        # Clean the chunk
+        clean_text = clean_chunk(chunk)
 
-    # Prepare prompt for better question generation
-    input_text = f"""Generate {x} insightful questions about the following text. The
+        # Prepare prompt for better question generation
+        input_text = f"""Generate {x} insightful questions about the following text. The
 text is taken from documents describing a fictional world or setting used for a tabletop rpg game.
 The text may contain references to characters, locations, events, or rules, as well as other documents
 or sources. Do not confuse these other documents with descriptions of books or other writings that appear
@@ -304,26 +270,36 @@ Text: {clean_text}
 
 Questions:"""
 
-    # Generate questions with ONNX model
-    outputs = generate_with_onnx(model, tokenizer, input_text, max_length=256, num_return_sequences=x, temperature=0.8)
+        # Generate questions
+        outputs = generate_text(model, tokenizer, input_text, max_length=256, num_return_sequences=x, temperature=0.8)
 
-    # Clean up the generated questions
-    clean_questions = []
-    for q in outputs:
-        # Extract just the question part if numbered
-        if re.match(r"^\d+[\.\)]\s", q):
-            q = re.sub(r"^\d+[\.\)]\s", "", q)
-        # Make sure it ends with a question mark
-        if not q.endswith("?"):
-            q += "?"
-        clean_questions.append(q)
+        # Clean up resources to free memory
+        del model
+        del tokenizer
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    return clean_questions[:x]  # Ensure we return exactly x questions
+        # Clean up the generated questions
+        clean_questions = []
+        for q in outputs:
+            # Extract just the question part if numbered
+            if re.match(r"^\d+[\.\)]\s", q):
+                q = re.sub(r"^\d+[\.\)]\s", "", q)
+            # Make sure it ends with a question mark
+            if not q.endswith("?"):
+                q += "?"
+            clean_questions.append(q)
+
+        return clean_questions[:x]  # Ensure we return exactly x questions
+    except Exception as e:
+        logger.error(f"Error generating questions: {e}")
+        # Return placeholder questions if generation fails
+        return [f"Question {i + 1} about the text?" for i in range(x)]
 
 
 def generate_cot_answer(question: str, oracle_context: str, model_name: str = "google/flan-t5-xl") -> dict:
     """
-    Generates a chain-of-thought answer with reasoning and citations from the context using optimum ONNX.
+    Generates a chain-of-thought answer with reasoning and citations from the context using PyTorch.
 
     Args:
         question: The question to answer
@@ -333,12 +309,12 @@ def generate_cot_answer(question: str, oracle_context: str, model_name: str = "g
     Returns:
         A dictionary with reasoning and final answer
     """
-    # Load the tokenizer and ONNX model
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    model = create_onnx_session(model_name)
+    try:
+        # Load model and tokenizer
+        model, tokenizer = load_model(model_name)
 
-    # Create a prompt that encourages chain-of-thought reasoning with citations
-    prompt = f"""Answer the following question based on the given context.
+        # Create a prompt that encourages chain-of-thought reasoning with citations
+        prompt = f"""Answer the following question based on the given context.
 The context is taken from documents describing a fictional world or setting used for a tabletop rpg game.
 It contain references to characters, locations, events, or rules, as well as other documents
 or sources. Do not confuse these other documents with descriptions of books or other writings that appear
@@ -353,39 +329,52 @@ Question: {question}
 
 Answer:"""
 
-    # Generate answer with ONNX model
-    outputs = generate_with_onnx(model, tokenizer, prompt, max_length=512, temperature=0.7)
+        # Generate answer
+        outputs = generate_text(model, tokenizer, prompt, max_length=512, temperature=0.7)
 
-    raw_answer = outputs[0]
+        # Clean up resources to free memory
+        del model
+        del tokenizer
+        gc.collect()
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # Process the answer to extract reasoning and final answer
-    try:
-        # Try to identify reasoning and final answer sections
-        reasoning_pattern = r"(?:.*?(?:According to the context|From the provided information|Based on the context|Looking at the context))(.*?)(?:Therefore,|In conclusion,|To summarize,|Thus,|So,|Final answer:|The answer is:)(.*)"  # noqa: E501
-        match = re.search(reasoning_pattern, raw_answer, re.DOTALL | re.IGNORECASE)
+        raw_answer = outputs[0]
 
-        if match:
-            reasoning = match.group(1).strip()
-            final_answer = match.group(2).strip()
-        else:
-            # If pattern not found, use a simpler split
-            lines = raw_answer.split("\n")
-            if len(lines) >= 3:
-                # Assume last line or two is the final answer
-                final_answer = "\n".join(lines[-2:])
-                reasoning = "\n".join(lines[:-2])
+        # Process the answer to extract reasoning and final answer
+        try:
+            # Try to identify reasoning and final answer sections
+            reasoning_pattern = r"(?:.*?(?:According to the context|From the provided information|Based on the context|Looking at the context))(.*?)(?:Therefore,|In conclusion,|To summarize,|Thus,|So,|Final answer:|The answer is:)(.*)"  # noqa: E501
+            match = re.search(reasoning_pattern, raw_answer, re.DOTALL | re.IGNORECASE)
+
+            if match:
+                reasoning = match.group(1).strip()
+                final_answer = match.group(2).strip()
             else:
-                reasoning = raw_answer
-                final_answer = raw_answer
+                # If pattern not found, use a simpler split
+                lines = raw_answer.split("\n")
+                if len(lines) >= 3:
+                    # Assume last line or two is the final answer
+                    final_answer = "\n".join(lines[-2:])
+                    reasoning = "\n".join(lines[:-2])
+                else:
+                    reasoning = raw_answer
+                    final_answer = raw_answer
 
-        # Insert quote markers around any direct quotes
-        reasoning_with_quotes = re.sub(r'"([^"]+)"', r"##begin_quote##\1##end_quote##", reasoning)
+            # Insert quote markers around any direct quotes
+            reasoning_with_quotes = re.sub(r'"([^"]+)"', r"##begin_quote##\1##end_quote##", reasoning)
 
-        return {"reasoning": reasoning_with_quotes, "final_answer": final_answer}
+            return {"reasoning": reasoning_with_quotes, "final_answer": final_answer}
 
+        except Exception as e:
+            logger.warning(f"Error parsing CoT answer: {e}")
+            return {"reasoning": "Based on the provided context, " + raw_answer, "final_answer": raw_answer}
     except Exception as e:
-        logger.warning(f"Error parsing CoT answer: {e}")
-        return {"reasoning": "Based on the provided context, " + raw_answer, "final_answer": raw_answer}
+        logger.error(f"Error generating CoT answer: {e}")
+        # Return a simple fallback answer
+        return {
+            "reasoning": f"Error generating reasoning: {str(e)}",
+            "final_answer": "Unable to generate a proper answer due to an error.",
+        }
 
 
 def add_chunk_to_dataset(
@@ -444,7 +433,7 @@ def add_chunk_to_dataset(
         # Construct model instruction
         context = ""
         for idx, doc in enumerate(docs):
-            context += f"<DOCUMENT {idx+1}>\n{str(doc)}\n</DOCUMENT {idx+1}>\n\n"
+            context += f"<DOCUMENT {idx + 1}>\n{str(doc)}\n</DOCUMENT {idx + 1}>\n\n"
         context += q
         datapt["instruction"] = context
 
@@ -529,7 +518,7 @@ def main():
             save_checkpoint(i, "checkpoint.txt")
 
             perc = ceil(i / num_chunks * 100)
-            logger.info(f"Processing chunk {i+1}/{num_chunks} ({perc}%)")
+            logger.info(f"Processing chunk {i + 1}/{num_chunks} ({perc}%)")
             add_chunk_to_dataset(
                 chunks, chunk, args.doctype, args.questions, NUM_DISTRACT_DOCS, args.p, args.qg_model, args.cot_model
             )
@@ -561,7 +550,7 @@ def main():
     else:
         for i, chunk in enumerate(chunks):
             perc = ceil(i / num_chunks * 100)
-            logger.info(f"Processing chunk {i+1}/{num_chunks} ({perc}%)")
+            logger.info(f"Processing chunk {i + 1}/{num_chunks} ({perc}%)")
             add_chunk_to_dataset(
                 chunks, chunk, args.doctype, args.questions, NUM_DISTRACT_DOCS, args.p, args.qg_model, args.cot_model
             )
@@ -595,4 +584,10 @@ def main():
 
 if __name__ == "__main__":
     logger.info("Starting the RAFT data generation script...")
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"An error occurred during execution: {e}")
+        import traceback
+
+        logger.error(traceback.format_exc())
