@@ -97,7 +97,7 @@
 	,"postCreateCommand": "git config --global --add safe.directory ${containerWorkspaceFolder}"
 
 	// 11. Use 'postStartCommand' to run a command each time the container starts successfully.
-	,"postStartCommand": "pip3 install --user -r requirements-dev.txt && pre-commit install"
+	,"postStartCommand": "pip3 install --user -r requirements-dev.txt && pre-commit install && export GPG_TTY=$(tty)"
 
 	// 12. Use 'postAttachCommand' to run a command each time a tool attaches to the container successfully.
 	// "postAttachCommand": "",
