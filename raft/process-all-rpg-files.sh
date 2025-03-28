@@ -19,7 +19,8 @@ CHUNK_SIZE=1024
 # Models to use
 QG_MODEL="google/flan-t5-large"
 COT_MODEL="google/flan-t5-xl"
-QA_MODEL="deepset/deberta-v3-large-squad2"
+# Force CPU only mode (to avoid GPU memory issues)
+CPU_ONLY=false
 
 # Create output directory if it doesn't exist
 mkdir -p "$OUTPUT_DIR"
@@ -68,6 +69,10 @@ while [[ $# -gt 0 ]]; do
         --qa-model)
             QA_MODEL="$2"
             shift 2
+            ;;
+        --cpu-only)
+            CPU_ONLY=true
+            shift
             ;;
         *)
             echo "Unknown parameter: $1"
@@ -139,17 +144,25 @@ process_file() {
     echo "  $filename: Started at $(date)" >> "$LOG_FILE"
 
     # Run the script
-    python raft_training_data_gen.py \
-        --datapath "$file" \
-        --output "$output_path" \
-        --doctype "$doctype" \
-        --questions "$QUESTIONS" \
-        --distractors "$DISTRACTORS" \
-        --p "$P_VALUE" \
-        --chunk_size "$CHUNK_SIZE" \
-        --qg-model "$QG_MODEL" \
-        --cot-model "$COT_MODEL" \
-        --qa-model "$QA_MODEL"
+    command="python raft_training_data_gen.py \
+        --datapath \"$file\" \
+        --output \"$output_path\" \
+        --doctype \"$doctype\" \
+        --questions \"$QUESTIONS\" \
+        --distractors \"$DISTRACTORS\" \
+        --p \"$P_VALUE\" \
+        --chunk_size \"$CHUNK_SIZE\" \
+        --qg-model \"$QG_MODEL\" \
+        --cot-model \"$COT_MODEL\""
+
+    # Add CPU-only flag if specified
+    if [ "$CPU_ONLY" = true ]; then
+        command+=" --cpu-only"
+    fi
+
+    # Execute with memory error handling
+    echo "Running: $command"
+    eval $command
 
     status=$?
     if [ $status -eq 0 ]; then
